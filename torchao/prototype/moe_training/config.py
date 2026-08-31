@@ -167,6 +167,20 @@ class MXFP8TrainingOpConfig(TrainingOpBaseConfig):
     # Rounding mode to use when calculating the e8m0 scale factors.
     scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL
 
+    # Whether to quantize grad_output ONCE in the backward pass, emitting both the
+    # rowwise (1x32, for dgrad) and colwise (32x1, for wgrad) MXFP8 forms from a
+    # single fused CuTeDSL kernel, instead of reading grad_output from HBM twice
+    # and running a standalone scale-swizzle pass.
+    #
+    # This is a pure implementation choice, NOT a numerics choice: the fused
+    # kernel is bit-exact with the three kernels it replaces, degenerate blocks
+    # included. Enabling it cannot change training results.
+    #
+    # Ignored (silently falls back) when wgrad_with_hp is set, on non-RCEIL
+    # modes, on non-bf16 grad_output, when the kernel is unavailable, or when
+    # total_M / N are not multiples of 128.
+    fuse_grad_out_cast: bool = False
+
     # Whether to pad the token group sizes to multiples of 32 (MXFP8 scaling block size).
     pad_token_groups_for_grouped_mm: bool = False
 

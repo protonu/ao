@@ -14,10 +14,14 @@ from torchao.prototype.moe_training.kernels.mxfp8 import (
 )
 from torchao.prototype.moe_training.kernels.mxfp8 import (
     mx_block_rearrange_2d_M_groups_cuda,
+    mxfp8_quantize_2d_1x32_32x1_cutedsl,
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_cuda_3d,
     triton_mx_block_rearrange_2d_K_groups,
     triton_mx_block_rearrange_per_group_3d,
+)
+from torchao.prototype.moe_training.kernels.mxfp8.quant import (
+    _mxfp8_cutedsl_kernels_available,
 )
 from torchao.prototype.moe_training.utils import (
     conditional_nostrict_trace,
@@ -51,6 +55,47 @@ _SM100_KERNELS_AVAILABLE = (
 )
 
 
+def _fused_grad_out_cast_applicable(
+    grad_output: torch.Tensor,
+    group_end_offsets: Optional[torch.Tensor],
+    block_size: int,
+    scale_calculation_mode: ScaleCalculationMode,
+    wgrad_with_hp: bool,
+) -> bool:
+    """Preconditions for the fused cast. Falls back silently when unmet.
+
+    * wgrad_with_hp -> the colwise output would be dead weight, so fusing loses.
+
+    Per-group sizes must be multiples of 128, but that is NOT checked here: it
+    would need a D2H sync on group_end_offsets. It is not a new restriction --
+    mxfp8_quantize_2d_1x32_cutedsl already validates it on device for the dgrad
+    path, so any config that works today already satisfies it.
+    """
+    if wgrad_with_hp or group_end_offsets is None:
+        return False
+    if not _mxfp8_cutedsl_kernels_available:
+        return False
+    if block_size != 32 or scale_calculation_mode != ScaleCalculationMode.RCEIL:
+        return False
+    if grad_output.dtype != torch.bfloat16 or not grad_output.is_contiguous():
+        return False
+    total_M, N = grad_output.shape
+    if total_M % 128 or N % 128:
+        return False
+
+    # NOTE: an uncovered tail (total_M > offs[-1]) is explicitly SUPPORTED and is
+    # the NORM -- a dropless MoE dispatcher sizes this buffer for worst-case
+    # per-expert padding (num_experts * 128) and fills a variable prefix. The
+    # fused kernel writes q_row/q_col/s_row for the whole buffer (matching
+    # mxfp8_quantize_2d_1x32_cutedsl, which uses offs only to validate) and zeros
+    # the s_col scale columns no group covers (matching
+    # triton_mx_block_rearrange_2d_K_groups, which iterates groups and returns
+    # new_zeros). There used to be a check here rejecting that case; it cost a
+    # D2H sync every backward and made this whole path a no-op for every real MoE
+    # caller including TorchTitan. See kernels/mxfp8/cutedsl_quantize_2d_1x32_32x1_fused.py.
+    return True
+
+
 # Aliases for convenience/clarity
 @conditional_nostrict_trace
 def _to_mxfp8_then_scaled_grouped_mm(
@@ -63,6 +108,7 @@ def _to_mxfp8_then_scaled_grouped_mm(
     wgrad_with_hp: bool = False,
     scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL,
     pad_token_groups_for_grouped_mm: bool = False,
+    fuse_grad_out_cast: bool = False,
 ) -> torch.Tensor:
     """
     Differentiable mxfp8 grouped gemm with dynamic mxfp8 quantization.
@@ -82,6 +128,7 @@ def _to_mxfp8_then_scaled_grouped_mm(
         wgrad_with_hp (bool): Whether to compute weight gradient in high precision. Defaults to False.
         scale_calculation_mode (ScaleCalculationMode): Mode for scale calculation (RCEIL, FLOOR, etc.). Defaults to ScaleCalculationMode.RCEIL.
         pad_token_groups_for_grouped_mm (bool): Whether to pad token groups to the next multiple of 32 (requirement for MXFP8 grouped GEMM). If your tokens are already padded, set to False.
+        fuse_grad_out_cast (bool): Whether to quantize grad_output once for both dgrad and wgrad in the backward pass, using a single fused CuTeDSL kernel instead of two casts plus a swizzle. Bit-exact with the unfused path; falls back silently when unsupported. Defaults to False.
 
     Returns:
         out (torch.Tensor): The result of the mxfp8 scaled grouped gemm.
@@ -98,6 +145,7 @@ def _to_mxfp8_then_scaled_grouped_mm(
         wgrad_with_hp,
         scale_calculation_mode,
         pad_token_groups_for_grouped_mm,
+        fuse_grad_out_cast,
     )
 
     # add bias outside the autograd function so that autograd
@@ -128,6 +176,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         wgrad_with_hp: bool = False,
         scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL,
         pad_token_groups_for_grouped_mm: bool = False,
+        fuse_grad_out_cast: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass: Quantize inputs and perform grouped GEMM.
@@ -141,6 +190,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             wgrad_with_hp: Compute weight gradient in high precision
             scale_calculation_mode: Mode for scale calculation (RCEIL, FLOOR, etc.)
             pad_token_groups_for_grouped_mm: Whether to pad token groups to the next multiple of 32
+            fuse_grad_out_cast: Quantize grad_output once for both dgrad and wgrad in backward
 
         Returns:
             Output tensor, shape (M, N)
@@ -232,6 +282,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         ctx.wgrad_with_hp = wgrad_with_hp
         ctx.scale_calculation_mode = scale_calculation_mode
         ctx.pad_token_groups_for_grouped_mm = pad_token_groups_for_grouped_mm
+        ctx.fuse_grad_out_cast = fuse_grad_out_cast
         ctx.num_tokens = num_tokens
 
         assert output.shape[0] == num_tokens
@@ -265,6 +316,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         wgrad_with_hp = ctx.wgrad_with_hp
         scale_calculation_mode = ctx.scale_calculation_mode
         pad_token_groups_for_grouped_mm = ctx.pad_token_groups_for_grouped_mm
+        fuse_grad_out_cast = ctx.fuse_grad_out_cast
         num_tokens = ctx.num_tokens
 
         # Pad grad_output if padding was used in forward (needed for both dgrad and wgrad)
@@ -280,6 +332,32 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         else:
             padded_grad_output = grad_output
 
+        # Optionally quantize grad_output ONCE for both consumers below, instead
+        # of reading it from HBM twice. Bit-exact with the unfused path; see
+        # MXFP8TrainingOpConfig.fuse_grad_out_cast. Both pre-quantized forms are
+        # None when the flag is off or a precondition is unmet, and every
+        # consumer falls back to casting for itself.
+        grad_out_rowwise = None
+        grad_out_colwise = None
+        if kernel_preference != KernelPreference.EMULATED and (
+            fuse_grad_out_cast
+            and _fused_grad_out_cast_applicable(
+                padded_grad_output,
+                padded_group_end_offsets,
+                block_size,
+                scale_calculation_mode,
+                wgrad_with_hp,
+            )
+        ):
+            q_row, s_row, q_col, s_col = mxfp8_quantize_2d_1x32_32x1_cutedsl(
+                padded_grad_output,
+                padded_group_end_offsets,
+                block_size=block_size,
+                scaling_mode=scale_calculation_mode.value.lower(),
+            )
+            grad_out_rowwise = (q_row, s_row)
+            grad_out_colwise = (q_col, s_col)
+
         # Compute gradient w.r.t. input activations
         grad_input = _compute_dgrad(
             padded_grad_output,
@@ -289,6 +367,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             out_dtype,
             scale_calculation_mode,
             kernel_preference,
+            grad_output_rowwise=grad_out_rowwise,
         )
 
         # Compute gradient w.r.t. weights (high-precision or quantized)
@@ -302,6 +381,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             scale_calculation_mode,
             wgrad_with_hp,
             kernel_preference,
+            grad_output_colwise=grad_out_colwise,
         )
 
         # Unpad grad_input if padding was used
@@ -324,6 +404,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             None,  # wgrad_with_hp
             None,  # scale_calculation_mode
             None,  # pad_token_groups_for_grouped_mm
+            None,  # fuse_grad_out_cast
         )
 
 
@@ -379,6 +460,7 @@ def _compute_dgrad(
     out_dtype: torch.dtype,
     scale_calculation_mode: ScaleCalculationMode,
     kernel_preference: KernelPreference,
+    grad_output_rowwise: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     Compute gradient w.r.t. input activations, dispatching to AUTO or EMULATED path.
@@ -391,6 +473,9 @@ def _compute_dgrad(
         out_dtype: Output dtype
         scale_calculation_mode: Mode for scale calculation
         kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
+        grad_output_rowwise: Optional pre-quantized (qdata, blocked_scales) for
+            grad_output, 1x32 along N with M-groups swizzled scales, produced by
+            the fused dim0+dim1 cast in backward(). Skips the cast when given.
 
     Returns:
         grad_input, shape (M, K)
@@ -412,6 +497,7 @@ def _compute_dgrad(
             block_size,
             out_dtype,
             scale_calculation_mode,
+            grad_output_rowwise=grad_output_rowwise,
         )
 
 
@@ -424,6 +510,7 @@ def _compute_wgrad(
     scale_calculation_mode: ScaleCalculationMode,
     wgrad_with_hp: bool,
     kernel_preference: KernelPreference,
+    grad_output_colwise: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     Compute gradient w.r.t. weights, dispatching to AUTO or EMULATED path.
@@ -437,6 +524,10 @@ def _compute_wgrad(
         scale_calculation_mode: Mode for scale calculation
         wgrad_with_hp: Whether to compute weight gradient in high precision
         kernel_preference: If EMULATED, use EMULATED path (native PyTorch), else use AUTO (SM100 kernels)
+        grad_output_colwise: Optional pre-quantized (qdata, blocked_scales) for
+            grad_output, 32x1 along M with K-groups swizzled scales, produced by
+            the fused dim0+dim1 cast in backward(). Skips both the cast and the
+            standalone swizzle pass when given.
 
     Returns:
         grad_weight_t, shape (E, K, N)
@@ -460,6 +551,7 @@ def _compute_wgrad(
             out_dtype,
             scale_calculation_mode,
             wgrad_with_hp,
+            grad_output_colwise=grad_output_colwise,
         )
 
 
@@ -601,6 +693,7 @@ def _compute_dgrad_sm100(
     block_size: int,
     out_dtype: torch.dtype,
     scale_calculation_mode: ScaleCalculationMode,
+    grad_output_rowwise: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     Compute gradient w.r.t. input activations using AUTO path (SM100 kernels).
@@ -612,12 +705,18 @@ def _compute_dgrad_sm100(
         block_size: Block size for quantization
         out_dtype: Output dtype
         scale_calculation_mode: Mode for scale calculation
+        grad_output_rowwise: Optional pre-quantized (qdata, blocked_scales),
+            already in the M-groups swizzled layout this function would produce.
 
     Returns:
         grad_input, shape (M, K)
     """
     # Quantize grad_output along dim0
-    if isinstance(grad_output, MXTensor):
+    if grad_output_rowwise is not None:
+        # Already cast by the fused dim0+dim1 kernel in backward(); the scales
+        # come out swizzled, so there is nothing to rearrange.
+        grad_out_e4m3, grad_output_scales_blocked = grad_output_rowwise
+    elif isinstance(grad_output, MXTensor):
         grad_out_e4m3, grad_output_scales_blocked = grad_output.qdata, grad_output.scale
         if not grad_output.is_swizzled_scales:
             # Convert scales to blocked layout for SM100 kernels
@@ -717,6 +816,7 @@ def _compute_wgrad_sm100(
     out_dtype: torch.dtype,
     scale_calculation_mode: ScaleCalculationMode,
     wgrad_with_hp: bool = False,
+    grad_output_colwise: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     Compute gradient w.r.t. weights using AUTO path (SM100 kernels).
@@ -729,6 +829,9 @@ def _compute_wgrad_sm100(
         out_dtype: Output dtype
         scale_calculation_mode: Mode for scale calculation
         wgrad_with_hp: Whether to compute weight gradient in high precision
+        grad_output_colwise: Optional pre-quantized (qdata, blocked_scales),
+            already in the K-groups swizzled layout, from the fused dim0+dim1
+            cast in backward(). Never set when wgrad_with_hp is True.
 
     Returns:
         grad_weight_t, shape (E, K, N)
@@ -747,17 +850,23 @@ def _compute_wgrad_sm100(
         return grad_weight.transpose(-2, -1)
 
     # Use CUDA kernel for dim1 quant
-    grad_output_t_mx = _to_mxfp8_dim1_kernel_wrapper(
-        grad_output,
-        block_size,
-        elem_dtype=torch.float8_e4m3fn,
-        hp_dtype=grad_output.dtype,
-        kernel_preference=KernelPreference.AUTO,
-        cast_kernel_choice=MXFP8Dim1CastKernelChoice.CUDA,
-        scale_calculation_mode=scale_calculation_mode,
-    )
-    grad_output_t_data = grad_output_t_mx.qdata
-    grad_output_t_scales = grad_output_t_mx.scale
+    if grad_output_colwise is not None:
+        # Already cast by the fused dim0+dim1 kernel in backward(), and its
+        # scales are emitted swizzled -- so this skips BOTH the second bf16 read
+        # of grad_output and its standalone K-groups rearrange below.
+        grad_output_t_data, grad_output_t_scales_blocked = grad_output_colwise
+    else:
+        grad_output_t_mx = _to_mxfp8_dim1_kernel_wrapper(
+            grad_output,
+            block_size,
+            elem_dtype=torch.float8_e4m3fn,
+            hp_dtype=grad_output.dtype,
+            kernel_preference=KernelPreference.AUTO,
+            cast_kernel_choice=MXFP8Dim1CastKernelChoice.CUDA,
+            scale_calculation_mode=scale_calculation_mode,
+        )
+        grad_output_t_data = grad_output_t_mx.qdata
+        grad_output_t_scales = grad_output_t_mx.scale
 
     input_act_t_mx = _to_mxfp8_dim1_kernel_wrapper(
         input_act,
@@ -773,10 +882,11 @@ def _compute_wgrad_sm100(
 
     # Convert scales to blocked layout for SM100 kernels
     scale_group_offsets = group_end_offsets // block_size
-    grad_output_t_scales_blocked = triton_mx_block_rearrange_2d_K_groups(
-        grad_output_t_scales,
-        scale_group_offsets,
-    )
+    if grad_output_colwise is None:
+        grad_output_t_scales_blocked = triton_mx_block_rearrange_2d_K_groups(
+            grad_output_t_scales,
+            scale_group_offsets,
+        )
     input_act_t_scales_blocked = triton_mx_block_rearrange_2d_K_groups(
         input_act_t_scales,
         scale_group_offsets,
